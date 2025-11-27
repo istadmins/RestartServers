@@ -70,7 +70,7 @@ try {
     $restartPendingServers = @()
     foreach ($serverName_LoopVar in $cleanedServers) {
         try {
-            if (Test-Connection -ComputerName $serverName_LoopVar -Count 2 -Quiet -ErrorAction Stop) {
+            if (Test-Connection -ComputerName $serverName_LoopVar -Count 1 -Quiet -ErrorAction Stop) {
                 $result = Invoke-Command -ComputerName $serverName_LoopVar -ScriptBlock {
                     $regPendingCBS = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
                     $regPendingWU = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
@@ -124,79 +124,208 @@ try {
     foreach ($groupPrefix_LoopVar in $groupedServers.Keys) {
         $serversInGroup = $groupedServers[$groupPrefix_LoopVar]
         Write-ScriptLog -Level INFO -Message "Grup işleniyor: '$groupPrefix_LoopVar' ($($serversInGroup.Count) sunucu)"
-        $randomIndex = Get-Random -Maximum $serversInGroup.Count
-        $serverToRestartCandidate = $serversInGroup[$randomIndex].ServerName
-        Write-ScriptLog -Level INFO -Message "NON-CLUSTER RASTGELE SUNUCU SEÇİLDİ (Grup: '$groupPrefix_LoopVar'): '$serverToRestartCandidate'"
-    }
-}
 
-if ($serverToRestartCandidate) {
-    $serversToRestart += $serverToRestartCandidate
-}
-else { 
-    Write-ScriptLog -Level WARNING -Message "Grup '$groupPrefix_LoopVar' için yeniden başlatılacak aday SEÇİLEMEDİ." 
-}
-
-} # End foreach group
-
-if ($serversToRestart.Count -eq 0) {
-    Write-ScriptLog -Level INFO -Message "Tüm gruplar işlendi. Yeniden başlatılacak uygun sunucu bulunamadı."
-    exit
-}
-
-# Local machine koruması (sona alma)
-if ($serversToRestart -contains $localMachine) {
-    $tempArray = @($serversToRestart | Where-Object { $_ -ne $localMachine })
-    $tempArray += $localMachine
-    $serversToRestart = $tempArray
-}
-
-$serversToRestart = $serversToRestart | Select-Object -Unique
-Write-ScriptLog -Level INFO -Message "YENİDEN BAŞLATILACAK NİHAİ LİSTE: $($serversToRestart -join ', ')"
-
-foreach ($serverToRestart_Item in $serversToRestart) {
-    if ($TestMode) {
-        Write-ScriptLog -Level INFO -Message "[TEST MODU] Sunucu '$serverToRestart_Item' yeniden BAŞLATILACAKTI."
-        $restartedServers += [PSCustomObject]@{ ServerName = $serverToRestart_Item; Status = "Restart Pending (Test Mode - Would Restart)" }
-    }
-    else {
-        Write-ScriptLog -Level INFO -Message "Yeniden başlatılıyor: $serverToRestart_Item"
-        try {
-            Restart-Computer -ComputerName $serverToRestart_Item -Force -Wait -Timeout $MaxWaitSeconds -ErrorAction Stop
-            Write-ScriptLog -Level INFO -Message "Sunucu '$serverToRestart_Item' başarıyla yeniden başlatıldı."
-            $restartedServers += [PSCustomObject]@{ ServerName = $serverToRestart_Item; Status = "Restarted" }
+        if ($ExcludedPrefixes -contains $groupPrefix_LoopVar) {
+            Write-ScriptLog -Level INFO -Message "'$groupPrefix_LoopVar' grubu hariç tutuldu."
+            continue
         }
-        catch {
-            Write-ScriptLog -Level ERROR -Message "Sunucu '$serverToRestart_Item' yeniden başlatılırken hata: $($_.Exception.Message)"
-            $restartedServers += [PSCustomObject]@{ ServerName = $serverToRestart_Item; Status = "Restart Failed" }
+
+        # =================================================================================
+        # === DÜZELTİLMİŞ CLUSTER MANTIĞI ===
+        # Mantık: Cluster durumunu sorgulamak için komutu (Get-ClusterGroup vb.)
+        # doğrudan cluster üyesi olan sunucunun içinde çalıştırıyoruz.
+        # =================================================================================
+        $isClusterGroup = $false
+        $serverToRestartCandidate = $null
+        
+        # Grup içinde en az bir sunucu varsa kontrol et
+        if ($serversInGroup.Count -gt 0) {
+            $candidateServerNameForClusterCheck = $serversInGroup[0].ServerName
+            
+            try {
+                # Cluster analizini uzaktaki sunucuda yap ve sonuçları buraya nesne olarak getir
+                $clusterAnalysis = Invoke-Command -ComputerName $candidateServerNameForClusterCheck -ArgumentList (, $ClusterGroupFilters) -ScriptBlock {
+                    param($Filters)
+                    
+                    # Modülü yüklemeyi dene
+                    Import-Module FailoverClusters -ErrorAction SilentlyContinue
+                    
+                    # FIX: Get-Cluster komutunun var olup olmadığını kontrol et.
+                    # Eğer modül yüklenemediyse Get-Cluster komutu da olmayacaktır.
+                    if (Get-Command "Get-Cluster" -ErrorAction SilentlyContinue) {
+                        $cl = Get-Cluster -ErrorAction SilentlyContinue
+                    }
+                    else {
+                        $cl = $null
+                    }
+                    
+                    if ($cl) {
+                        # Cluster bulundu
+                        
+                        # 1. Filtreye uyan Rolleri (Group) bul (Örn: *MSMQ*)
+                        $allGroups = Get-ClusterGroup
+                        $matchedGroups = @()
+                        if ($Filters) {
+                            foreach ($f in $Filters) {
+                                $matchedGroups += $allGroups | Where-Object { $_.Name -like $f }
+                            }
+                        }
+                        else {
+                            $matchedGroups = $allGroups
+                        }
+                        
+                        # 2. Bu rollerin şu anki SAHİBİ (Owner) olan node'ları bul.
+                        # Not: OwnerNode bazen obje bazen string dönebilir, garantiye alıyoruz.
+                        $activeNodeNames = @()
+                        foreach ($g in $matchedGroups) {
+                            if ($g.OwnerNode -is [string]) {
+                                $activeNodeNames += $g.OwnerNode
+                            }
+                            elseif ($g.OwnerNode.Name) {
+                                $activeNodeNames += $g.OwnerNode.Name
+                            }
+                        }
+                        $activeNodeNames = $activeNodeNames | Select-Object -Unique
+
+                        # 3. Clusterdaki tüm node'ları bul
+                        $allNodes = Get-ClusterNode | Where-Object { $_.State -eq "Up" } | Select-Object -ExpandProperty Name
+
+                        return [PSCustomObject]@{
+                            IsCluster   = $true
+                            ClusterName = $cl.Name
+                            ActiveNodes = $activeNodeNames
+                            AllNodes    = $allNodes
+                        }
+                    }
+                    else {
+                        return [PSCustomObject]@{ IsCluster = $false }
+                    }
+                } -ErrorAction Stop # Invoke-Command hatasında catch'e düş
+
+                if ($clusterAnalysis.IsCluster) {
+                    $isClusterGroup = $true
+                    $cName = $clusterAnalysis.ClusterName
+                    Write-ScriptLog -Level INFO -Message "Cluster Tespit Edildi: $cName. Analiz yapılıyor..."
+                    
+                    # Şu an işlem yaptığımız gruptaki ($serversInGroup) sunucuların hangileri Pasif?
+                    # Pasif = Cluster üyesi + Durumu UP + Aktif Node Listesinde YOK
+                    
+                    $actives = $clusterAnalysis.ActiveNodes
+                    
+                    # Restart listemizde olup (Pending), aynı zamanda Cluster'da pasif olanları bul
+                    $availablePassiveNodes = @()
+                    foreach ($srv in $serversInGroup) {
+                        if ($actives -notcontains $srv.ServerName) {
+                            $availablePassiveNodes += $srv.ServerName
+                        }
+                        else {
+                            Write-ScriptLog -Level INFO -Message "Atlanan Aktif Node: $($srv.ServerName) (Üzerinde çalışan roller var)"
+                        }
+                    }
+
+                    if ($availablePassiveNodes.Count -gt 0) {
+                        $serverToRestartCandidate = $availablePassiveNodes | Get-Random
+                        Write-ScriptLog -Level INFO -Message "CLUSTER PASİF NODE SEÇİLDİ (Grup: '$groupPrefix_LoopVar'): '$serverToRestartCandidate'"
+                    }
+                    else {
+                        Write-ScriptLog -Level WARNING -Message "Cluster ($cName) için restart bekleyen PASİF bir node bulunamadı. Hepsi aktif veya ulaşılamaz."
+                    }
+
+                }
+                else {
+                    # Cluster değil, normal logic'e düşecek
+                    Write-ScriptLog -Level INFO -Message "Sunucu '$candidateServerNameForClusterCheck' bir cluster üyesi değil."
+                }
+
+            }
+            catch {
+                Write-ScriptLog -Level WARNING -Message "Cluster kontrolü sırasında hata oluştu veya erişilemedi. Non-cluster olarak devam ediliyor. Hata: $($_.Exception.Message)"
+                $isClusterGroup = $false
+            }
+        }
+        # =================================================================================
+        # === SON: DÜZELTİLMİŞ CLUSTER MANTIĞI ===
+        # =================================================================================
+
+        # Eğer bu bir cluster grubu değilse VEYA cluster mantığı bir aday bulamadıysa
+        if (-not $isClusterGroup -or (-not $serverToRestartCandidate -and $isClusterGroup)) {
+            if ($isClusterGroup) {
+                Write-ScriptLog -Level INFO -Message "Cluster mantığı aday bulamadığı için non-cluster rastgele seçim mantığına geçildi."
+            }
+            if ($serversInGroup.Count -gt 0) {
+                $randomIndex = Get-Random -Maximum $serversInGroup.Count
+                $serverToRestartCandidate = $serversInGroup[$randomIndex].ServerName
+                Write-ScriptLog -Level INFO -Message "NON-CLUSTER RASTGELE SUNUCU SEÇİLDİ (Grup: '$groupPrefix_LoopVar'): '$serverToRestartCandidate'"
+            }
+        }
+
+        if ($serverToRestartCandidate) {
+            $serversToRestart += $serverToRestartCandidate
+        }
+        else { 
+            Write-ScriptLog -Level WARNING -Message "Grup '$groupPrefix_LoopVar' için yeniden başlatılacak aday SEÇİLEMEDİ." 
+        }
+
+    } # End foreach group
+
+    if ($serversToRestart.Count -eq 0) {
+        Write-ScriptLog -Level INFO -Message "Tüm gruplar işlendi. Yeniden başlatılacak uygun sunucu bulunamadı."
+        exit
+    }
+
+    # Local machine koruması (sona alma)
+    if ($serversToRestart -contains $localMachine) {
+        $tempArray = @($serversToRestart | Where-Object { $_ -ne $localMachine })
+        $tempArray += $localMachine
+        $serversToRestart = $tempArray
+    }
+
+    $serversToRestart = $serversToRestart | Select-Object -Unique
+    Write-ScriptLog -Level INFO -Message "YENİDEN BAŞLATILACAK NİHAİ LİSTE: $($serversToRestart -join ', ')"
+
+    foreach ($serverToRestart_Item in $serversToRestart) {
+        if ($TestMode) {
+            Write-ScriptLog -Level INFO -Message "[TEST MODU] Sunucu '$serverToRestart_Item' yeniden BAŞLATILACAKTI."
+            $restartedServers += [PSCustomObject]@{ ServerName = $serverToRestart_Item; Status = "Restart Pending (Test Mode - Would Restart)" }
+        }
+        else {
+            Write-ScriptLog -Level INFO -Message "Yeniden başlatılıyor: $serverToRestart_Item"
+            try {
+                Restart-Computer -ComputerName $serverToRestart_Item -Force -Wait -Timeout $MaxWaitSeconds -ErrorAction Stop
+                Write-ScriptLog -Level INFO -Message "Sunucu '$serverToRestart_Item' başarıyla yeniden başlatıldı."
+                $restartedServers += [PSCustomObject]@{ ServerName = $serverToRestart_Item; Status = "Restarted" }
+            }
+            catch {
+                Write-ScriptLog -Level ERROR -Message "Sunucu '$serverToRestart_Item' yeniden başlatılırken hata: $($_.Exception.Message)"
+                $restartedServers += [PSCustomObject]@{ ServerName = $serverToRestart_Item; Status = "Restart Failed" }
+            }
         }
     }
-}
 
-# Raporlama Bölümü
-$allServersReport = @()
-$list1ForReport = @($restartPendingServers.ServerName) 
-$list2ForReport = @($restartedServers.ServerName)  
-$combinedServerListForReport = ($list1ForReport + $list2ForReport) | Select-Object -Unique | Sort-Object
+    # Raporlama Bölümü
+    $allServersReport = @()
+    $list1ForReport = @($restartPendingServers.ServerName) 
+    $list2ForReport = @($restartedServers.ServerName)  
+    $combinedServerListForReport = ($list1ForReport + $list2ForReport) | Select-Object -Unique | Sort-Object
     
-foreach ($serverNameInReportScope in $combinedServerListForReport) {
-    $serverInRestartedList = $restartedServers | Where-Object { $_.ServerName -eq $serverNameInReportScope }
-    if ($serverInRestartedList) {
-        $allServersReport += $serverInRestartedList
-    }
-    else {
-        $serverInOriginalPendingList = $restartPendingServers | Where-Object { $_.ServerName -eq $serverNameInReportScope }
-        if ($serverInOriginalPendingList) {
-            $statusForNotSelected = if ($TestMode) { "Restart Pending (Test Mode - Not Selected)" } else { "Restart Pending (Not Selected)" }
-            $allServersReport += [PSCustomObject]@{ ServerName = $serverInOriginalPendingList.ServerName; Status = $statusForNotSelected }
+    foreach ($serverNameInReportScope in $combinedServerListForReport) {
+        $serverInRestartedList = $restartedServers | Where-Object { $_.ServerName -eq $serverNameInReportScope }
+        if ($serverInRestartedList) {
+            $allServersReport += $serverInRestartedList
+        }
+        else {
+            $serverInOriginalPendingList = $restartPendingServers | Where-Object { $_.ServerName -eq $serverNameInReportScope }
+            if ($serverInOriginalPendingList) {
+                $statusForNotSelected = if ($TestMode) { "Restart Pending (Test Mode - Not Selected)" } else { "Restart Pending (Not Selected)" }
+                $allServersReport += [PSCustomObject]@{ ServerName = $serverInOriginalPendingList.ServerName; Status = $statusForNotSelected }
+            }
         }
     }
-}
 
-$htmlTable = $allServersReport | Sort-Object ServerName | ConvertTo-Html -Fragment -Property ServerName, Status
+    $htmlTable = $allServersReport | Sort-Object ServerName | ConvertTo-Html -Fragment -Property ServerName, Status
     
-# HTML CSS ve Body
-$emailBody = @"
+    # HTML CSS ve Body
+    $emailBody = @"
 <!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -221,19 +350,19 @@ $emailBody = @"
 </html>
 "@
 
-if ($allServersReport.Count -gt 0) {
-    try {
-        $SmtpClient = New-Object Net.Mail.SmtpClient($SmtpServer, $SmtpPort)
-        $Message = New-Object System.Net.Mail.MailMessage($From, $To, "Server Durum Raporu $scriptMode - $localMachine", $emailBody)
-        $Message.IsBodyHtml = $true
-        $SmtpClient.Send($Message)
-        Write-ScriptLog -Level INFO -Message "E-posta başarıyla gönderildi."
+    if ($allServersReport.Count -gt 0) {
+        try {
+            $SmtpClient = New-Object Net.Mail.SmtpClient($SmtpServer, $SmtpPort)
+            $Message = New-Object System.Net.Mail.MailMessage($From, $To, "Server Durum Raporu $scriptMode - $localMachine", $emailBody)
+            $Message.IsBodyHtml = $true
+            $SmtpClient.Send($Message)
+            Write-ScriptLog -Level INFO -Message "E-posta başarıyla gönderildi."
+        }
+        catch {
+            Write-ScriptLog -Level ERROR -Message "E-posta gönderilemedi: $($_.Exception.Message)"
+        }
     }
-    catch {
-        Write-ScriptLog -Level ERROR -Message "E-posta gönderilemedi: $($_.Exception.Message)"
-    }
-}
-Write-ScriptLog -Level INFO -Message "Script tamamlandı."
+    Write-ScriptLog -Level INFO -Message "Script tamamlandı."
 }
 catch {
     Write-ScriptLog -Level ERROR -Message "[CRITICAL] Script hatası: $($_.Exception.Message)"
